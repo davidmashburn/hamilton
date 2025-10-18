@@ -41,6 +41,13 @@ code-comparisons/index
 
 ```{toctree}
 :hidden: True
+:caption: DOWNLOADS
+
+asf/downloads
+```
+
+```{toctree}
+:hidden: True
 :caption: PDF
 PDF <https://hamilton.apache.org/_static/Hamilton.pdf>
 ```
