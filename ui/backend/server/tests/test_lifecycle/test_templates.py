@@ -1,3 +1,20 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import random
 import string
 from typing import List, Tuple
@@ -89,7 +106,7 @@ async def test_create_and_get_dag_template(async_client: AsyncClient, db):
     project_id, *_ = await _setup_sample_project(async_client, username)
     post_dag_template_response = await async_client.post(
         f"/api/v1/dag_templates?{urlencode({'project_id': project_id})}",
-        data=dag_template_to_generate.dict(),
+        data=dag_template_to_generate.model_dump(),
         content_type="application/json",
         headers={"test_username": username},
     )
@@ -140,7 +157,7 @@ async def test_create_and_get_all_project_dag_templates(async_client: AsyncClien
         )
         post_dag_template_response = await async_client.post(
             f"/api/v1/dag_templates?{urlencode({'project_id': project_id})}",
-            data=dag_template_to_generate.dict(),
+            data=dag_template_to_generate.model_dump(),
             content_type="application/json",
             headers={"test_username": username},
         )

@@ -39,27 +39,27 @@ class VisibilityFull(Schema):
 
 
 class ProjectAttributeIn(ModelSchema):
-    class Config:
+    class Meta:
         model = ProjectAttribute
-        model_fields = ["name", "type", "schema_version", "value"]
+        fields = ["name", "type", "schema_version", "value"]
 
 
 class ProjectAttributeOut(ModelSchema):
-    class Config:
+    class Meta:
         model = ProjectAttribute
-        model_fields = ["name", "type", "schema_version", "value", "id", "project"]
+        fields = ["name", "type", "schema_version", "value", "id", "project"]
 
 
 class ProjectTeamMembershipOut(ModelSchema):
-    class Config:
+    class Meta:
         model = ProjectTeamMembership
-        model_fields = "__all__"
+        fields = "__all__"
 
 
 class ProjectUserMembershipOut(ModelSchema):
-    class Config:
+    class Meta:
         model = ProjectUserMembership
-        model_fields = "__all__"
+        fields = "__all__"
 
 
 # This is currently the schema we take from the UI
@@ -224,9 +224,9 @@ class ProjectOut(ProjectBase):
     created_at: datetime.datetime = Field(description="When the project was created")
     updated_at: datetime.datetime = Field(description="When the project was last updated")
 
-    class Config:
+    class Meta:
         model = Project
-        model_fields = "__all__"
+        fields = "__all__"
 
     @staticmethod
     async def from_model(project: Project, role: str) -> "ProjectOut":

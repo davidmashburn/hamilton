@@ -16,6 +16,14 @@
 # under the License.
 
 import datetime
+from datetime import timezone
+
+# Compatibility for Python < 3.11
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = timezone.utc
+
 import hashlib
 import inspect
 import json
@@ -835,7 +843,7 @@ class DAGWorksGraphExecutor(driver.GraphExecutor):
                 tracking_state.clock_end(status=Status.FAILURE)
                 raise e
             finally:
-                finally_block_time = datetime.datetime.utcnow()
+                finally_block_time = datetime.datetime.now(UTC)
                 if tracking_state.status != Status.SUCCESS:
                     tracking_state.status = Status.FAILURE
                     # this assumes the task map only has things that have been processed, not
