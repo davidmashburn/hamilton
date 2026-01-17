@@ -34,7 +34,7 @@ def node_with_display_name(input_a: int) -> int:
     return input_a + 1
 
 
-@tag(display_name="Special <Characters> & \"Quotes\"")
+@tag(display_name='Special <Characters> & "Quotes"')
 def node_with_special_chars(input_a: int) -> int:
     """A node with special HTML characters that need escaping."""
     return input_a * 2

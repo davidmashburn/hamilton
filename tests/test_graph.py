@@ -1370,7 +1370,7 @@ def test_create_graphviz_graph_display_name_html_escaping():
 
     # The raw special characters should NOT appear unescaped in the label
     # (they would break graphviz HTML parsing)
-    assert 'label=<<b>Special <Characters>' not in dot_string
+    assert "label=<<b>Special <Characters>" not in dot_string
 
 
 def test_create_graphviz_graph_without_display_name_backward_compatible():
