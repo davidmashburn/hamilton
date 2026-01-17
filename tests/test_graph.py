@@ -1309,3 +1309,89 @@ def test_update_dependencies():
     for node_name, node_ in new_nodes.items():
         assert node_.dependencies == nodes[node_name].dependencies
         assert node_.depended_on_by == nodes[node_name].depended_on_by
+
+
+# Tests for display_name tag support in graphviz visualization
+# See: https://github.com/apache/hamilton/issues/1413
+
+
+def test_create_graphviz_graph_with_display_name():
+    """Tests that display_name tag is used for node labels in visualization."""
+    import tests.resources.display_name_functions
+
+    config = {}
+    fg = graph.FunctionGraph.from_modules(tests.resources.display_name_functions, config=config)
+    nodes, user_nodes = fg.get_upstream_nodes(["output_node"])
+    all_nodes = nodes.union(user_nodes)
+
+    digraph = graph.create_graphviz_graph(
+        all_nodes,
+        "Display Name Test\n",
+        graphviz_kwargs={},
+        node_modifiers={},
+        strictly_display_only_nodes_passed_in=False,
+        config=config,
+    )
+    dot_string = str(digraph)
+
+    # Node with display_name should show the display name, not the function name
+    assert "My Custom Display Name" in dot_string
+    assert "Final Output Node" in dot_string
+
+    # Node without display_name should show the function name
+    assert "node_without_display_name" in dot_string
+
+
+def test_create_graphviz_graph_display_name_html_escaping():
+    """Tests that display_name values with special characters are properly HTML escaped."""
+    import tests.resources.display_name_functions
+
+    config = {}
+    fg = graph.FunctionGraph.from_modules(tests.resources.display_name_functions, config=config)
+    nodes, user_nodes = fg.get_upstream_nodes(["node_with_special_chars"])
+    all_nodes = nodes.union(user_nodes)
+
+    digraph = graph.create_graphviz_graph(
+        all_nodes,
+        "HTML Escape Test\n",
+        graphviz_kwargs={},
+        node_modifiers={},
+        strictly_display_only_nodes_passed_in=False,
+        config=config,
+    )
+    dot_string = str(digraph)
+
+    # Special characters should be HTML escaped
+    # < becomes &lt;, > becomes &gt;, & becomes &amp;, " becomes &quot;
+    assert "&lt;" in dot_string  # <
+    assert "&gt;" in dot_string  # >
+    assert "&amp;" in dot_string  # &
+    assert "&quot;" in dot_string  # "
+
+    # The raw special characters should NOT appear unescaped in the label
+    # (they would break graphviz HTML parsing)
+    assert 'label=<<b>Special <Characters>' not in dot_string
+
+
+def test_create_graphviz_graph_without_display_name_backward_compatible():
+    """Tests that nodes without display_name tag still work as before."""
+    import tests.resources.dummy_functions
+
+    config = {}
+    fg = graph.FunctionGraph.from_modules(tests.resources.dummy_functions, config=config)
+    nodes, user_nodes = fg.get_upstream_nodes(["A", "B"])
+    all_nodes = nodes.union(user_nodes)
+
+    digraph = graph.create_graphviz_graph(
+        all_nodes,
+        "Backward Compatibility Test\n",
+        graphviz_kwargs={},
+        node_modifiers={},
+        strictly_display_only_nodes_passed_in=False,
+        config=config,
+    )
+    dot_string = str(digraph)
+
+    # Without display_name tag, node names should be used (existing behavior)
+    assert "<b>A</b>" in dot_string
+    assert "<b>B</b>" in dot_string
