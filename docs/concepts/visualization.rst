@@ -167,7 +167,7 @@ Configure your visualization
 All of the above visualization functions share parameters to customize the visualization (e.g., hide legend, hide inputs). Learn more by reviewing the API reference for `Driver.display_all_functions() <https://hamilton.apache.org/reference/drivers/Driver/#hamilton.driver.Driver.display_all_functions>`_; parameters should apply to all other visualizations.
 
 Custom node labels with display_name
-----------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Use the ``@tag`` decorator with ``display_name`` to show human-readable labels in visualizations while keeping valid Python identifiers as function names. This is useful for creating presentation-ready diagrams or adding business-friendly names:
 
