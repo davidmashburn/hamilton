@@ -17,6 +17,7 @@
 
 import base64
 import json
+import os
 import tempfile
 import uuid
 from pathlib import Path
@@ -37,6 +38,98 @@ from prefect.artifacts import (
 )
 
 from hamilton import base, driver
+
+
+def _maybe_hamilton_ui_tracker(
+    dag_name: str,
+    tags: dict[str, str] | None = None,
+):
+    """Optionally attach Hamilton UI tracking when env vars are provided.
+
+    Required env vars:
+    - HAMILTON_UI_USERNAME
+    - HAMILTON_UI_PROJECT_ID
+
+    Optional endpoint overrides (for local UI):
+    - HAMILTON_API_URL
+    - HAMILTON_UI_URL
+    """
+    logger = get_run_logger()
+    username = os.getenv("HAMILTON_UI_USERNAME")
+    project_id_raw = os.getenv("HAMILTON_UI_PROJECT_ID")
+
+    if not username or not project_id_raw:
+        return None
+
+    try:
+        project_id = int(project_id_raw)
+    except ValueError:
+        logger.warning(
+            "Skipping Hamilton UI tracker: HAMILTON_UI_PROJECT_ID=%r is not an integer.",
+            project_id_raw,
+        )
+        return None
+
+    try:
+        from hamilton_sdk import adapters as hamilton_ui_adapters
+    except ImportError as exc:
+        logger.warning(
+            "Skipping Hamilton UI tracker: hamilton_sdk is not installed. "
+            "Install with sf-hamilton[ui]. Error: %s",
+            exc,
+        )
+        return None
+
+    try:
+        tracker = hamilton_ui_adapters.HamiltonTracker(
+            project_id=project_id,
+            username=username,
+            dag_name=dag_name,
+            tags=tags or {},
+        )
+        logger.info(
+            "Hamilton UI tracking enabled for dag=%s project_id=%s ui=%s",
+            dag_name,
+            project_id,
+            os.getenv("HAMILTON_UI_URL", "default"),
+        )
+        return tracker
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Skipping Hamilton UI tracker initialization: %s", exc)
+        return None
+
+
+def _snapshot_hamilton_ui_run_ids(tracker: Any | None) -> set[int]:
+    """Capture Hamilton UI run IDs known before execution so we can find the new one."""
+    if tracker is None:
+        return set()
+    return set(getattr(tracker, "dw_run_ids", {}).values())
+
+
+def _publish_hamilton_ui_permalink(
+    *,
+    tracker: Any | None,
+    known_run_ids: set[int],
+    prefect_task_name: str,
+) -> None:
+    """Publish the Hamilton UI run permalink into Prefect logs + artifacts."""
+    if tracker is None:
+        return
+
+    logger = get_run_logger()
+    dw_run_ids = set(getattr(tracker, "dw_run_ids", {}).values())
+    new_run_ids = sorted(dw_run_ids - known_run_ids)
+    if not new_run_ids:
+        logger.warning("Hamilton UI permalink unavailable for %s (no new tracked run ID found).", prefect_task_name)
+        return
+
+    run_id = new_run_ids[-1]
+    run_url = f"{tracker.hamilton_ui_url}/dashboard/project/{tracker.project_id}/runs/{run_id}"
+    logger.info("Hamilton UI run permalink for %s: %s", prefect_task_name, run_url)
+    create_markdown_artifact(
+        description=f"Hamilton UI permalink ({prefect_task_name})",
+        markdown=f"[Open Hamilton UI run for `{prefect_task_name}`]({run_url})",
+    )
 
 
 def _publish_hamilton_execution_dag(
@@ -94,14 +187,36 @@ def prepare_data_task(
 
     raw_df = pd.read_csv(raw_data_location, sep=";")
 
-    dr = driver.Driver(hamilton_config, prepare_data)
+    builder = (
+        driver.Builder()
+        .with_config(hamilton_config)
+        .with_modules(prepare_data)
+        .with_adapter(base.SimplePythonDataFrameGraphAdapter())
+    )
+    tracker = _maybe_hamilton_ui_tracker(
+        dag_name="prefect_prepare_data_task",
+        tags={
+            "orchestrator": "prefect",
+            "prefect_task": "prepare_data_task",
+            "example": "prefect_absenteeism",
+        },
+    )
+    if tracker is not None:
+        builder = builder.with_adapters(tracker)
+    dr = builder.build()
 
     prepare_final_vars = prepare_data.ALL_FEATURES + [label]
     prepare_inputs = {"raw_df": raw_df}
+    tracked_run_ids_before_execute = _snapshot_hamilton_ui_run_ids(tracker)
 
     features_df = dr.execute(
         final_vars=prepare_final_vars,
         inputs=prepare_inputs,
+    )
+    _publish_hamilton_ui_permalink(
+        tracker=tracker,
+        known_run_ids=tracked_run_ids_before_execute,
+        prefect_task_name="prepare_data_task",
     )
 
     _publish_hamilton_execution_dag(
@@ -157,12 +272,23 @@ def train_and_evaluate_model_task(
         description="Initializing Hamilton driver",
     )
 
-    dr = driver.Driver(
-        hamilton_config,
-        train_model,
-        evaluate_model,
-        adapter=base.SimplePythonGraphAdapter(base.DictResult()),
+    builder = (
+        driver.Builder()
+        .with_config(hamilton_config)
+        .with_modules(train_model, evaluate_model)
+        .with_adapter(base.SimplePythonGraphAdapter(base.DictResult()))
     )
+    tracker = _maybe_hamilton_ui_tracker(
+        dag_name="prefect_train_and_evaluate_model_task",
+        tags={
+            "orchestrator": "prefect",
+            "prefect_task": "train_and_evaluate_model_task",
+            "example": "prefect_absenteeism",
+        },
+    )
+    if tracker is not None:
+        builder = builder.with_adapters(tracker)
+    dr = builder.build()
 
     hamilton_final_vars = ["save_validation_preds", "model_results"]
     hamilton_inputs = dict(
@@ -178,10 +304,16 @@ def train_and_evaluate_model_task(
         progress=45.0,
         description="Running Hamilton model pipeline",
     )
+    tracked_run_ids_before_execute = _snapshot_hamilton_ui_run_ids(tracker)
 
     results = dr.execute(
         final_vars=hamilton_final_vars,
         inputs=hamilton_inputs,
+    )
+    _publish_hamilton_ui_permalink(
+        tracker=tracker,
+        known_run_ids=tracked_run_ids_before_execute,
+        prefect_task_name="train_and_evaluate_model_task",
     )
 
     _publish_hamilton_execution_dag(
