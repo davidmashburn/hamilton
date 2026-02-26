@@ -77,13 +77,13 @@ What you get:
 Deployments are how you move from manual runs to managed, schedulable runs.
 
 Live example in this environment:
-1. `absenteeism-local` deployment is registered and ready.
+1. `absenteeism-local` deployment is registered, with the current status shown inline (for example `Ready` or `Not Ready`).
 2. It has an hourly schedule attached.
 3. The activity sparkline shows recent execution history.
 
 ## 7) Work Pools (Execution Infrastructure)
 
-![Work pools annotated](./imgs/orchestration_demo/prefect_ui_walkthrough/annotated/work-pools-empty-state-annotated.png)
+![Work pools annotated](./imgs/orchestration_demo/prefect_ui_walkthrough/annotated/work-pools-list-annotated.png)
 
 Work pools let you control where deployments run.
 
