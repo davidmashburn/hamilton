@@ -42,6 +42,7 @@ Notes
 """
 
 import argparse
+import html
 import json
 import math
 import sys
@@ -478,25 +479,80 @@ def _target_anchor_point(rect: tuple[float, float, float, float], mode: str) -> 
     )
 
 
-def draw_annotations(
-    clean_image_path: Path,
-    output_path: Path,
+def _compute_label_layout(
+    draw: ImageDraw.ImageDraw,
+    callouts: list[dict[str, Any]],
+    prepared_rects: list[dict[str, Any]],
+    surface_size: tuple[int, int],
+    label_css_to_surface_point=None,
+) -> list[dict[str, Any]]:
+    """Compute label placement + connector endpoints on an axis-aligned surface.
+
+    This is shared by the image renderer and the in-page SVG overlay renderer so they use the same
+    placement heuristics (label collision handling, connector anchoring, etc.).
+    """
+    placed_label_rects: list[tuple[float, float, float, float]] = []
+    out: list[dict[str, Any]] = []
+
+    by_idx = {int(item["idx"]): item for item in prepared_rects}
+    for idx, callout in enumerate(callouts, start=1):
+        item = by_idx[idx]
+        min_x, min_y, max_x, max_y = item["rect_xyxy"]
+        label_css = callout.get("label_css")
+        if label_css is not None:
+            if label_css_to_surface_point is not None:
+                p = label_css_to_surface_point(float(label_css[0]), float(label_css[1]))
+                preferred_tx, preferred_ty = float(p[0]), float(p[1])
+            else:
+                preferred_tx, preferred_ty = float(label_css[0]), float(label_css[1])
+        else:
+            preferred_tx, preferred_ty = min_x + 8.0, max(8.0, min_y - 38.0)
+
+        text = f"{idx}. {callout['text']}"
+        tw = float(draw.textlength(text, font=FONT_SMALL))
+        th = 36.0
+        label_w = tw + 18.0
+        label_h = th + 8.0
+        tx, ty = _choose_label_position(
+            (preferred_tx, preferred_ty),
+            (label_w, label_h),
+            (min_x, min_y, max_x, max_y),
+            placed_label_rects,
+            surface_size,
+        )
+
+        label_rect = (tx, ty, tx + label_w, ty + label_h)
+        anchor_mode = callout.get("line_anchor", "top-left")
+        target_pref = _target_anchor_point((min_x, min_y, max_x, max_y), str(anchor_mode))
+        if callout.get("line_anchor_perimeter", True):
+            ax, ay = _nearest_point_on_rect_perimeter((min_x, min_y, max_x, max_y), _rect_center(label_rect))
+        else:
+            ax, ay = target_pref
+        lx, ly = _nearest_point_on_rect_perimeter(label_rect, (ax, ay))
+        placed_label_rects.append(label_rect)
+        out.append(
+            {
+                **item,
+                "text_full": text,
+                "label_rect": label_rect,
+                "connector_line": ((lx, ly), (ax, ay)),
+            }
+        )
+    return out
+
+
+def _prepare_annotations_image_space(
+    img: Image.Image,
     affine: Affine2D,
     callouts: list[dict[str, Any]],
-) -> None:
-    img = Image.open(clean_image_path).convert("RGBA")
+) -> list[dict[str, Any]]:
+    """Prepare target rectangles in image pixel space (with optional edge refinement)."""
     edge_map = _compute_edge_strength(img.convert("RGB"))
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    placed_label_rects: list[tuple[float, float, float, float]] = []
     prepared: list[dict[str, Any]] = []
-
     for idx, callout in enumerate(callouts, start=1):
         box_vals = callout["box_css"]
         box = Box(float(box_vals[0]), float(box_vals[1]), float(box_vals[2]), float(box_vals[3]))
         poly = affine.transform_box_polygon(box)
-
-        # Axis-aligned bounds for default label placement and line anchor.
         min_x = min(p.x for p in poly)
         min_y = min(p.y for p in poly)
         max_x = max(p.x for p in poly)
@@ -514,68 +570,132 @@ def draw_annotations(
             )
             min_x, min_y, max_x, max_y = rect_xyxy
 
-        poly_xy = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
-
         prepared.append(
             {
                 "idx": idx,
                 "callout": callout,
-                "rect_xyxy": (min_x, min_y, max_x, max_y),
-                "poly_xy": poly_xy,
+                "rect_xyxy": rect_xyxy,
+                "poly_xy": [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)],
                 "area": max(0.0, (max_x - min_x) * (max_y - min_y)),
             }
         )
+    return prepared
+
+
+def _prepare_annotations_css_space(callouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prepare target rectangles directly in CSS pixels (no transform, no edge refinement)."""
+    prepared: list[dict[str, Any]] = []
+    for idx, callout in enumerate(callouts, start=1):
+        x, y, w, h = [float(v) for v in callout["box_css"]]
+        rect_xyxy = (x, y, x + w, y + h)
+        prepared.append(
+            {
+                "idx": idx,
+                "callout": callout,
+                "rect_xyxy": rect_xyxy,
+                "poly_xy": [(x, y), (x + w, y), (x + w, y + h), (x, y + h)],
+                "area": max(0.0, w * h),
+            }
+        )
+    return prepared
+
+
+def _svg_style_color(rgb_or_rgba: tuple[int, ...]) -> str:
+    r, g, b = rgb_or_rgba[:3]
+    if len(rgb_or_rgba) == 4:
+        a = float(rgb_or_rgba[3]) / 255.0
+        return f"rgba({r},{g},{b},{a:.4f})"
+    return f"rgb({r},{g},{b})"
+
+
+def build_svg_overlay_markup(
+    doc_w_css: float,
+    doc_h_css: float,
+    callouts: list[dict[str, Any]],
+) -> str:
+    """Render the current callout visual style as an SVG overlay in document/CSS coordinates."""
+    dummy_img = Image.new("RGBA", (max(1, int(math.ceil(doc_w_css))), max(1, int(math.ceil(doc_h_css)))), (0, 0, 0, 0))
+    dummy_draw = ImageDraw.Draw(dummy_img)
+    prepared = _prepare_annotations_css_space(callouts)
+    labels = _compute_label_layout(dummy_draw, callouts, prepared, dummy_img.size)
+
+    fill_css = _svg_style_color(FILL)
+    accent_css = _svg_style_color(ACCENT)
+    label_bg_css = _svg_style_color(LABEL_BG)
+    text_css = _svg_style_color(WHITE)
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{doc_w_css:.3f}" height="{doc_h_css:.3f}" viewBox="0 0 {doc_w_css:.3f} {doc_h_css:.3f}" aria-hidden="true" data-codex-annotation-overlay="1">',
+        "<defs></defs>",
+    ]
+
+    # Draw larger target regions first.
+    for item in sorted(labels, key=lambda it: float(it["area"]), reverse=True):
+        x0, y0, x1, y1 = item["rect_xyxy"]
+        w = max(0.0, x1 - x0)
+        h = max(0.0, y1 - y0)
+        parts.append(
+            f'<rect x="{x0:.3f}" y="{y0:.3f}" width="{w:.3f}" height="{h:.3f}" fill="{fill_css}" stroke="{accent_css}" stroke-width="4" />'
+        )
+
+    # Draw labels and connectors in authored order.
+    for item in sorted(labels, key=lambda it: int(it["idx"])):
+        (lx0, ly0, lx1, ly1) = item["label_rect"]
+        ((cx0, cy0), (cx1, cy1)) = item["connector_line"]
+        parts.append(
+            f'<line x1="{cx0:.3f}" y1="{cy0:.3f}" x2="{cx1:.3f}" y2="{cy1:.3f}" stroke="{accent_css}" stroke-width="3" stroke-linecap="round" />'
+        )
+        parts.append(
+            f'<rect x="{lx0:.3f}" y="{ly0:.3f}" width="{(lx1-lx0):.3f}" height="{(ly1-ly0):.3f}" rx="8" ry="8" fill="{label_bg_css}" stroke="{accent_css}" stroke-width="2" />'
+        )
+        # Approximate baseline to match the Pillow-rendered labels.
+        text_x = lx0 + 9.0
+        text_y = ly0 + 31.0
+        parts.append(
+            f'<text x="{text_x:.3f}" y="{text_y:.3f}" fill="{text_css}" font-size="19" font-family="Arial, Helvetica, sans-serif">{html.escape(str(item["text_full"]))}</text>'
+        )
+
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def draw_annotations(
+    clean_image_path: Path,
+    output_path: Path,
+    affine: Affine2D,
+    callouts: list[dict[str, Any]],
+) -> None:
+    img = Image.open(clean_image_path).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    prepared = _prepare_annotations_image_space(img, affine, callouts)
+    labels = _compute_label_layout(
+        draw,
+        callouts,
+        prepared,
+        img.size,
+        label_css_to_surface_point=lambda x, y: affine.transform_point(Point(x, y)).as_tuple(),
+    )
 
     # Draw larger regions first so nested/smaller callouts remain visible on top.
-    for item in sorted(prepared, key=lambda it: it["area"], reverse=True):
+    for item in sorted(labels, key=lambda it: it["area"], reverse=True):
         poly_xy = item["poly_xy"]
         draw.polygon(poly_xy, fill=FILL)
         draw.line(poly_xy + [poly_xy[0]], fill=ACCENT, width=4, joint="curve")
 
     # Draw labels + connectors in the authored order (preserves numbering narrative).
-    for item in sorted(prepared, key=lambda it: int(it["idx"])):
-        idx = int(item["idx"])
-        callout = dict(item["callout"])
-        min_x, min_y, max_x, max_y = item["rect_xyxy"]
-        label_css = callout.get("label_css")
-        if label_css is not None:
-            label_pt = affine.transform_point(Point(float(label_css[0]), float(label_css[1])))
-            preferred_tx, preferred_ty = label_pt.x, label_pt.y
-        else:
-            preferred_tx, preferred_ty = min_x + 8.0, max(8.0, min_y - 38.0)
-
-        text = f"{idx}. {callout['text']}"
-        tw = float(draw.textlength(text, font=FONT_SMALL))
-        th = 36.0
-        label_w = tw + 18.0
-        label_h = th + 8.0
-        tx, ty = _choose_label_position(
-            (preferred_tx, preferred_ty),
-            (label_w, label_h),
-            (min_x, min_y, max_x, max_y),
-            placed_label_rects,
-            (img.width, img.height),
-        )
-
+    for item in sorted(labels, key=lambda it: int(it["idx"])):
+        tx0, ty0, tx1, ty1 = item["label_rect"]
         draw.rounded_rectangle(
-            [tx, ty, tx + label_w, ty + label_h],
+            [tx0, ty0, tx1, ty1],
             radius=8,
             fill=LABEL_BG,
             outline=ACCENT,
             width=2,
         )
-        draw.text((tx + 9.0, ty + 7.0), text, font=FONT_SMALL, fill=WHITE)
-
-        label_rect = (tx, ty, tx + label_w, ty + label_h)
-        anchor_mode = callout.get("line_anchor", "top-left")
-        target_pref = _target_anchor_point((min_x, min_y, max_x, max_y), str(anchor_mode))
-        if callout.get("line_anchor_perimeter", True):
-            ax, ay = _nearest_point_on_rect_perimeter((min_x, min_y, max_x, max_y), _rect_center(label_rect))
-        else:
-            ax, ay = target_pref
-        lx, ly = _nearest_point_on_rect_perimeter(label_rect, (ax, ay))
+        draw.text((tx0 + 9.0, ty0 + 7.0), str(item["text_full"]), font=FONT_SMALL, fill=WHITE)
+        (lx, ly), (ax, ay) = item["connector_line"]
         draw.line([(lx, ly), (ax, ay)], fill=ACCENT, width=3)
-        placed_label_rects.append(label_rect)
 
     out = Image.alpha_composite(img, overlay).convert("RGB")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -647,6 +767,109 @@ def inject_markers_js(marker_css_points: dict[str, Point], marker_size_css: int 
 
 def remove_markers_js() -> str:
     return "document.getElementById('__codex_calibration_markers__')?.remove();"
+
+
+def inject_svg_overlay_js(svg_markup: str) -> str:
+    payload = json.dumps(svg_markup)
+    return f"""
+(() => {{
+  const existing = document.getElementById('__codex_annotation_overlay_root__');
+  if (existing) existing.remove();
+  const host = document.createElement('div');
+  host.id = '__codex_annotation_overlay_root__';
+  host.style.position = 'absolute';
+  host.style.left = '0px';
+  host.style.top = '0px';
+  host.style.zIndex = '2147483647';
+  host.style.pointerEvents = 'none';
+  host.style.width = '0px';
+  host.style.height = '0px';
+  host.setAttribute('aria-hidden', 'true');
+  host.innerHTML = {payload};
+  const svg = host.firstElementChild;
+  if (svg) {{
+    svg.style.position = 'absolute';
+    svg.style.left = '0px';
+    svg.style.top = '0px';
+    svg.style.pointerEvents = 'none';
+    svg.style.overflow = 'visible';
+  }}
+  (document.body || document.documentElement).appendChild(host);
+}})();
+"""
+
+
+def remove_svg_overlay_js() -> str:
+    return "document.getElementById('__codex_annotation_overlay_root__')?.remove();"
+
+
+def _normalize_page_zoom(page) -> None:
+    try:
+        page.evaluate(
+            """() => {
+              if (document.documentElement) document.documentElement.style.zoom = '100%';
+              if (document.body) document.body.style.zoom = '100%';
+            }"""
+        )
+    except Exception:
+        pass
+
+
+def _install_prefect_modal_handlers(page) -> None:
+    add_handler = getattr(page, "add_locator_handler", None)
+    if not callable(add_handler):
+        return
+    for sel in ["button:has-text('Skip')", "button[aria-label='Close']", "button:has-text('Try it now')"]:
+        loc = page.locator(sel).first
+        try:
+            add_handler(loc, lambda loc=loc: loc.click(timeout=300, force=True))
+        except Exception:
+            continue
+
+
+def _install_screenshot_style(page, css_text: str) -> None:
+    if not css_text:
+        return
+    try:
+        page.evaluate(
+            """(cssText) => {
+              let el = document.getElementById('__codex_screenshot_style__');
+              if (!el) {
+                el = document.createElement('style');
+                el.id = '__codex_screenshot_style__';
+                (document.head || document.documentElement).appendChild(el);
+              }
+              el.textContent = cssText;
+            }""",
+            css_text,
+        )
+    except Exception:
+        pass
+
+
+def _remove_screenshot_style(page) -> None:
+    try:
+        page.evaluate("() => document.getElementById('__codex_screenshot_style__')?.remove()")
+    except Exception:
+        pass
+
+
+def _screenshot_with_optional_style(page, path: Path, *, full_page: bool, scale: str, css_text: str = "") -> None:
+    try:
+        if css_text:
+            page.screenshot(path=str(path), full_page=full_page, scale=scale, style=css_text)
+        else:
+            page.screenshot(path=str(path), full_page=full_page, scale=scale)
+        return
+    except TypeError:
+        pass
+    if css_text:
+        _install_screenshot_style(page, css_text)
+    try:
+        page.screenshot(path=str(path), full_page=full_page, scale=scale)
+    finally:
+        if css_text:
+            _remove_screenshot_style(page)
 
 
 def _prefect_close_modal(page) -> None:
@@ -731,6 +954,163 @@ def _capture_callout_boxes_via_playwright(page, callouts: list[dict[str, Any]]) 
             out["label_css"] = [out["box_css"][0] + float(dx), out["box_css"][1] + float(dy)]
         resolved.append(out)
     return resolved
+
+
+def _playwright_capture_dom_overlay(args: argparse.Namespace) -> int:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # pragma: no cover - optional dependency path
+        print(
+            "Playwright is required for capture-dom-overlay. Run with something like:\n"
+            "  uv run --no-project --with playwright --with pillow --with numpy python ... capture-dom-overlay ...\n"
+            f"Import error: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    spec_path = Path(args.spec)
+    spec = json.loads(spec_path.read_text())
+    annotated_path = Path(args.annotated_out)
+    clean_path = Path(args.clean_screenshot) if args.clean_screenshot else None
+    metadata_out = Path(args.metadata_out) if args.metadata_out else None
+
+    viewport = spec.get("viewport", {"width": 1280, "height": 800})
+    full_page = bool(spec.get("full_page", True))
+    url = spec["url"]
+    callouts = spec["callouts"]
+    actions = spec.get("actions", [])
+    screenshot_scale = str(spec.get("screenshot_scale", "css"))
+    device_scale_factor = float(spec.get("device_scale_factor", 1.0))
+    wait_for_ms = int(spec.get("wait_for_ms", 1200))
+    close_prefect_modal = bool(spec.get("close_prefect_modal", False))
+    chromepath = spec.get("chromium_executable_path")
+    screenshot_style = str(spec.get("screenshot_style_css", ""))
+    hide_selectors = spec.get("hide_selectors", [])
+    if hide_selectors:
+        screenshot_style += "\n" + "\n".join(
+            f"{sel} {{ visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }}"
+            for sel in hide_selectors
+        )
+    if close_prefect_modal:
+        screenshot_style += "\n" + "\n".join(
+            [
+                "div[role='dialog'][aria-modal='true'] { display: none !important; }",
+                "div:has(> button:has-text('Try it now')) { display: none !important; }",
+            ]
+        )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path=chromepath)
+        ctx = browser.new_context(
+            viewport={"width": int(viewport["width"]), "height": int(viewport["height"])},
+            device_scale_factor=device_scale_factor,
+        )
+        page = ctx.new_page()
+
+        if close_prefect_modal:
+            _install_prefect_modal_handlers(page)
+
+        for rr in spec.get("route_rewrites", []):
+            src_prefix = rr["source_prefix"]
+            dst_prefix = rr["dest_prefix"]
+
+            def make_rewriter(src_prefix=src_prefix, dst_prefix=dst_prefix):
+                def _rewrite(route):
+                    u = route.request.url
+                    if u.startswith(src_prefix):
+                        route.continue_(url=dst_prefix + u[len(src_prefix):])
+                    else:
+                        route.continue_()
+                return _rewrite
+
+            page.route(src_prefix + "**", make_rewriter())
+
+        page.goto(url, wait_until=spec.get("wait_until", "domcontentloaded"), timeout=int(spec.get("timeout_ms", 60000)))
+        _normalize_page_zoom(page)
+        if wait_for_ms:
+            page.wait_for_timeout(wait_for_ms)
+        if close_prefect_modal:
+            _prefect_close_modal(page)
+
+        if wait_selector := spec.get("wait_for_selector"):
+            page.locator(wait_selector).first.wait_for(timeout=int(spec.get("wait_selector_timeout_ms", 30000)))
+
+        for action in actions:
+            kind = action["type"]
+            sel = action.get("selector")
+            timeout_ms = int(action.get("timeout_ms", 10000))
+            if kind == "click":
+                page.locator(sel).first.click(timeout=timeout_ms)
+                if close_prefect_modal:
+                    _prefect_close_modal(page)
+            elif kind == "wait":
+                page.wait_for_timeout(int(action.get("ms", 500)))
+            elif kind == "wait_for":
+                page.locator(sel).first.wait_for(timeout=timeout_ms)
+            elif kind == "eval":
+                page.evaluate(action["script"])
+            else:
+                raise ValueError(f"Unsupported action type: {kind}")
+
+        resolved_callouts = _capture_callout_boxes_via_playwright(page, callouts)
+        metrics = page.evaluate(
+            """() => ({
+              scrollX: window.scrollX,
+              scrollY: window.scrollY,
+              innerWidth: window.innerWidth,
+              innerHeight: window.innerHeight,
+              devicePixelRatio: window.devicePixelRatio,
+              docWidth: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, document.documentElement.clientWidth),
+              docHeight: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, document.documentElement.clientHeight),
+            })"""
+        )
+        doc_w = float(metrics["docWidth"])
+        doc_h = float(metrics["docHeight"])
+
+        if clean_path is not None:
+            _screenshot_with_optional_style(
+                page,
+                clean_path,
+                full_page=full_page,
+                scale=screenshot_scale,
+                css_text=screenshot_style,
+            )
+
+        svg_markup = build_svg_overlay_markup(doc_w, doc_h, resolved_callouts)
+        page.evaluate(inject_svg_overlay_js(svg_markup))
+        page.wait_for_timeout(int(spec.get("overlay_settle_ms", 80)))
+        _screenshot_with_optional_style(
+            page,
+            annotated_path,
+            full_page=full_page,
+            scale=screenshot_scale,
+            css_text=screenshot_style,
+        )
+        page.evaluate(remove_svg_overlay_js())
+        browser.close()
+
+    if metadata_out:
+        metadata = {
+            "mode": "dom-overlay",
+            "url": url,
+            "full_page": full_page,
+            "viewport": viewport,
+            "metrics": metrics,
+            "screenshot_scale": screenshot_scale,
+            "device_scale_factor": device_scale_factor,
+            "clean_screenshot": str(clean_path) if clean_path else None,
+            "annotated_out": str(annotated_path),
+            "callouts": resolved_callouts,
+        }
+        metadata_out.parent.mkdir(parents=True, exist_ok=True)
+        metadata_out.write_text(json.dumps(metadata, indent=2))
+
+    print(f"Annotated screenshot: {annotated_path}")
+    if clean_path:
+        print(f"Clean screenshot: {clean_path}")
+    if metadata_out:
+        print(f"Metadata: {metadata_out}")
+    return 0
 
 
 def _playwright_capture_and_render(args: argparse.Namespace) -> int:
@@ -1025,6 +1405,16 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     p_cap.add_argument("--metadata-out")
     p_cap.add_argument("--calibration-screenshot", help="Optional explicit path for calibration screenshot")
     p_cap.set_defaults(func=_playwright_capture_and_render)
+
+    p_dom = sub.add_parser(
+        "capture-dom-overlay",
+        help="Capture page with Playwright and render annotations as an in-page SVG overlay in CSS space",
+    )
+    p_dom.add_argument("--spec", required=True, help="JSON spec containing url, interactions, and callouts")
+    p_dom.add_argument("--annotated-out", required=True)
+    p_dom.add_argument("--clean-screenshot")
+    p_dom.add_argument("--metadata-out")
+    p_dom.set_defaults(func=_playwright_capture_dom_overlay)
 
     return parser.parse_args(list(argv))
 

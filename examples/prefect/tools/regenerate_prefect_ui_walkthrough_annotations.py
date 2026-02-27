@@ -128,7 +128,7 @@ LEGACY_COORDS = {
     "blocks-empty-state-annotated": [
         {
             "text": "Add block button",
-            "selector": "button:has-text('Add Block')",
+            "selector": "text=Add Block",
             "pad_css": [8, 6, 8, 6],
             "label_offset_css": [-280, -56],
             "edge_refine": False,
@@ -138,7 +138,7 @@ LEGACY_COORDS = {
     "variables-empty-state-annotated": [
         {
             "text": "Add variable button",
-            "selector": "button:has-text('Add Variable')",
+            "selector": "text=Add Variable",
             "pad_css": [8, 6, 8, 6],
             "label_offset_css": [-270, -56],
             "edge_refine": False,
@@ -148,7 +148,7 @@ LEGACY_COORDS = {
     "automations-empty-state-annotated": [
         {
             "text": "Add automation button",
-            "selector": "button:has-text('Add Automation')",
+            "selector": "text=Add Automation",
             "pad_css": [8, 6, 8, 6],
             "label_offset_css": [-300, -56],
             "edge_refine": False,
@@ -184,13 +184,25 @@ LEGACY_COORDS = {
 
 COMMON = {
     "viewport": {"width": 1280, "height": 800},
-    "device_scale_factor": 1.25,
-    "screenshot_scale": "device",
+    "device_scale_factor": 1.0,
+    "screenshot_scale": "css",
     "full_page": True,
     "wait_for_ms": 1200,
     "close_prefect_modal": True,
     "max_fit_error_px": 1.25,
     "chromium_executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "screenshot_style_css": """
+div[role='dialog'][aria-modal='true'],
+div[aria-label='Join the Prefect Community'],
+.Toastify,
+[data-testid='toast'],
+[aria-live='polite'],
+[aria-live='assertive'] {
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+""",
 }
 
 
@@ -318,6 +330,12 @@ def build_shots(base_url: str) -> list[dict[str, Any]]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:4200")
+    ap.add_argument(
+        "--mode",
+        choices=["dom-overlay", "legacy-calibrated"],
+        default="dom-overlay",
+        help="Annotation renderer mode. dom-overlay is preferred; legacy-calibrated is fallback.",
+    )
     ap.add_argument("--only", action="append", default=[], help="Repeatable screenshot name filter")
     ap.add_argument("--list", action="store_true", help="List available screenshot names and exit")
     return ap.parse_args()
@@ -345,25 +363,40 @@ def main() -> int:
         meta_path = META_DIR / f"{shot['name']}.json"
         out_path = OUT_DIR / f"{shot['name']}.png"
         spec_path.write_text(json.dumps(spec, indent=2))
-        argv = [
-            "capture-and-render",
-            "--spec", str(spec_path),
-            "--clean-screenshot", str(clean_path),
-            "--annotated-out", str(out_path),
-            "--metadata-out", str(meta_path),
-            "--calibration-screenshot", str(cal_path),
-        ]
+        if args.mode == "dom-overlay":
+            argv = [
+                "capture-dom-overlay",
+                "--spec", str(spec_path),
+                "--annotated-out", str(out_path),
+                "--metadata-out", str(meta_path),
+                "--clean-screenshot", str(clean_path),
+            ]
+        else:
+            argv = [
+                "capture-and-render",
+                "--spec", str(spec_path),
+                "--clean-screenshot", str(clean_path),
+                "--annotated-out", str(out_path),
+                "--metadata-out", str(meta_path),
+                "--calibration-screenshot", str(cal_path),
+            ]
         print(f"\n=== {shot['name']} ===")
         rc = int(renderer.main(argv))
         if rc != 0:
             return rc
         meta = json.loads(meta_path.read_text())
-        fit = meta["fit"]
-        summary.append({"name": shot["name"], "max_error_px": fit["max_error_px"], "rms_error_px": fit["rms_error_px"]})
+        if "fit" in meta:
+            fit = meta["fit"]
+            summary.append({"name": shot["name"], "mode": args.mode, "max_error_px": fit["max_error_px"], "rms_error_px": fit["rms_error_px"]})
+        else:
+            summary.append({"name": shot["name"], "mode": args.mode})
 
     print("\n=== SUMMARY ===")
     for row in summary:
-        print(f"{row['name']}: max={row['max_error_px']:.3f}px rms={row['rms_error_px']:.3f}px")
+        if "max_error_px" in row:
+            print(f"{row['name']} [{row['mode']}]: max={row['max_error_px']:.3f}px rms={row['rms_error_px']:.3f}px")
+        else:
+            print(f"{row['name']} [{row['mode']}]")
     (META_DIR / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"Metadata dir: {META_DIR}")
     return 0
